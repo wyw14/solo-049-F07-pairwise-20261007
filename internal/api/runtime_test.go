@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	stationclock "orbitlink/internal/clock"
+	"orbitlink/internal/decoder"
 	passsvc "orbitlink/internal/pass"
 	"orbitlink/internal/receiver"
+	"orbitlink/internal/recorder"
 	"orbitlink/internal/rf"
 	"orbitlink/internal/satellite"
 	"orbitlink/internal/weather"
@@ -122,6 +125,68 @@ func TestRouterRejectsOverlappingReservation(t *testing.T) {
 	if _, err := runtime.Reservations.ReservePass(second.ID, second.AntennaID); err == nil {
 		t.Fatal("overlapping reservation unexpectedly succeeded")
 	}
+}
+
+func TestRecordingDrainPreviewAndSealEndpoints(t *testing.T) {
+	runtime := newTestRuntime(t)
+	router, err := NewRouter(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	segment, err := runtime.Recorder.Start("PASS-DRAIN", "north", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for sequence := uint64(1); sequence <= 3; sequence++ {
+		if err := runtime.Recorder.Buffer(segment.ID, passsvcFrame(sequence)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var preview map[string]any
+	decodeBody(t, requestJSON(t, server.Client(), "GET", server.URL+"/api/recordings/"+segment.ID+"/seal-preview", ""), &preview)
+	if preview["ready"] != false {
+		t.Fatalf("buffered segment should not be seal ready: %#v", preview)
+	}
+
+	var drained map[string]any
+	decodeBody(t, requestJSON(t, server.Client(), "POST", server.URL+"/api/recordings/"+segment.ID+"/drain", ""), &drained)
+	if drained["complete"] != true || drained["frames_remaining"].(float64) != 0 || drained["checksum_sha256"] == "" {
+		t.Fatalf("drain response wrong: %#v", drained)
+	}
+
+	decodeBody(t, requestJSON(t, server.Client(), "GET", server.URL+"/api/recordings/"+segment.ID+"/seal-preview", ""), &preview)
+	if preview["ready"] != true || preview["verified"] != true {
+		t.Fatalf("drained segment should be seal ready: %#v", preview)
+	}
+
+	var sealed map[string]any
+	decodeBody(t, requestJSON(t, server.Client(), "POST", server.URL+"/api/recordings/"+segment.ID+"/seal", `{"reason":"endpoint test"}`), &sealed)
+	segmentView, _ := sealed["segment"].(map[string]any)
+	if sealed["complete"] != true || segmentView["checksum_sha256"] != drained["checksum_sha256"] {
+		t.Fatalf("seal response wrong: %#v", sealed)
+	}
+
+	// A sealed file that is tampered with must be reported by the preview.
+	recordingPath := runtime.Paths.Recording(segment.ID)
+	file, err := os.OpenFile(recordingPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = file.Write([]byte{0x01})
+	_ = file.Close()
+	decodeBody(t, requestJSON(t, server.Client(), "GET", server.URL+"/api/recordings/"+segment.ID+"/seal-preview", ""), &preview)
+	if preview["verified"] != false {
+		t.Fatalf("tampered sealed recording should fail verification: %#v", preview)
+	}
+}
+
+func passsvcFrame(sequence uint64) recorder.Frame {
+	payload := decoder.EncodeTelemetry(sequence, 32)
+	return recorder.Frame{Sequence: sequence, Epoch: 1, Received: time.Now().UTC(), Payload: payload}
 }
 
 func newTestRuntime(t *testing.T) *Runtime {

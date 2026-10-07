@@ -14,6 +14,9 @@ import (
 type session struct {
 	segment Segment
 	buffer  []Frame
+	// drain serializes drain passes for this segment so two concurrent drains
+	// cannot append the same buffered frame twice.
+	drain sync.Mutex
 }
 
 type Manager struct {

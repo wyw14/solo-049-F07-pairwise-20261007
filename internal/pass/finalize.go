@@ -3,6 +3,7 @@ package pass
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"orbitlink/internal/audit"
@@ -11,10 +12,12 @@ import (
 )
 
 type FinalizeResult struct {
-	PassID        string              `json:"pass_id"`
-	UnlockError   string              `json:"unlock_error,omitempty"`
-	FramesDrained int                 `json:"frames_drained"`
-	Seal          recorder.SealResult `json:"seal"`
+	PassID        string               `json:"pass_id"`
+	UnlockError   string               `json:"unlock_error,omitempty"`
+	Drain         recorder.DrainResult `json:"drain"`
+	FramesDrained int                  `json:"frames_drained"`
+	Preview       recorder.SealPreview `json:"seal_preview"`
+	Seal          recorder.SealResult  `json:"seal"`
 }
 
 type Finalizer struct {
@@ -51,10 +54,22 @@ func (f *Finalizer) Finalize(ctx context.Context, passID, chainID string) (Final
 	if unlockErr != nil {
 		result.UnlockError = unlockErr.Error()
 	}
-	drained, drainErr := f.recorder.Drain(ctx, value.RecordingSegmentID)
-	result.FramesDrained = drained
+	drain, drainErr := f.recorder.Drain(ctx, value.RecordingSegmentID)
+	result.Drain = drain
+	result.FramesDrained = drain.WrittenThisRun
 	if drainErr != nil {
+		// Keep the seal preview so callers see the exact written/unwritten
+		// boundary even when the drain was canceled mid-flight.
+		result.Preview, _ = f.recorder.PreviewSeal(value.RecordingSegmentID)
 		return result, drainErr
+	}
+	preview, err := f.recorder.PreviewSeal(value.RecordingSegmentID)
+	result.Preview = preview
+	if err != nil {
+		return result, err
+	}
+	if !preview.Ready {
+		return result, fmt.Errorf("recording segment %s not ready to seal: %s", value.RecordingSegmentID, strings.Join(preview.Blockers, "; "))
 	}
 	seal, err := f.recorder.Seal(value.RecordingSegmentID, "pass LOS complete")
 	result.Seal = seal
@@ -67,6 +82,6 @@ func (f *Finalizer) Finalize(ctx context.Context, passID, chainID string) (Final
 	}); err != nil {
 		return result, err
 	}
-	_, _ = f.audit.Record(audit.Event{Component: "pass", Action: "finalized", Subject: passID, Fields: map[string]any{"frames_drained": drained, "unlock_error": result.UnlockError}})
+	_, _ = f.audit.Record(audit.Event{Component: "pass", Action: "finalized", Subject: passID, Fields: map[string]any{"frames_drained": drain.FramesWritten, "unlock_error": result.UnlockError, "sha256": preview.ChecksumSHA256}})
 	return result, nil
 }

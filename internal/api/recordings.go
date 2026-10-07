@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"time"
 
@@ -13,6 +14,51 @@ import (
 
 func (r *Runtime) listRecordings(writer http.ResponseWriter, _ *http.Request) {
 	writeJSON(writer, http.StatusOK, map[string]any{"items": r.Recorder.List()})
+}
+
+func (r *Runtime) drainRecording(writer http.ResponseWriter, request *http.Request) {
+	result, err := r.Recorder.Drain(request.Context(), chi.URLParam(request, "segmentID"))
+	if err != nil {
+		// A canceled or partially completed drain is a 409 carrying the
+		// progress body; callers need the written/unwritten split to retry.
+		if result.Total > 0 {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(writer).Encode(map[string]any{"error": err.Error(), "drain": result})
+			return
+		}
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, result)
+}
+
+func (r *Runtime) previewSealRecording(writer http.ResponseWriter, request *http.Request) {
+	preview, err := r.Recorder.PreviewSeal(chi.URLParam(request, "segmentID"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, preview)
+}
+
+func (r *Runtime) sealRecording(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Reason string `json:"reason"`
+	}
+	if err := decodeJSON(request, &input); err != nil {
+		writeError(writer, err)
+		return
+	}
+	if input.Reason == "" {
+		input.Reason = "operator sealed"
+	}
+	result, err := r.Recorder.Seal(chi.URLParam(request, "segmentID"), input.Reason)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, result)
 }
 
 func (r *Runtime) appendFrame(writer http.ResponseWriter, request *http.Request) {

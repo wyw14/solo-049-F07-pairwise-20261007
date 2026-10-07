@@ -2,6 +2,7 @@ package recorder
 
 import (
 	"fmt"
+	"time"
 
 	"orbitlink/internal/audit"
 )
@@ -29,20 +30,56 @@ func (m *Manager) Transfer(segmentID, from, to string, expectedGeneration int64)
 }
 
 func (m *Manager) CloseForOwner(segmentID, station string, expectedGeneration int64, reason string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	current, found := m.sessions[segmentID]
+	m.mu.RLock()
+	session, found := m.sessions[segmentID]
 	if !found {
+		m.mu.RUnlock()
 		return fmt.Errorf("recording segment %s not found", segmentID)
 	}
+	m.mu.RUnlock()
+
+	// Serialize against an in-flight drain just like Seal.
+	session.drain.Lock()
+	defer session.drain.Unlock()
+
+	m.mu.Lock()
+	current := m.sessions[segmentID]
 	if current.segment.OwnerStation != station || current.segment.OwnerGeneration != expectedGeneration {
 		_, _ = m.audit.Record(audit.Event{Component: "recorder", Action: "stale-close.ignored", Subject: segmentID, Severity: audit.Warning, Fields: map[string]any{"station": station, "expected_generation": expectedGeneration, "current_generation": current.segment.OwnerGeneration}})
+		m.mu.Unlock()
 		return nil
 	}
 	if len(current.buffer) > 0 {
+		m.mu.Unlock()
 		return fmt.Errorf("owner close rejected while %d frames remain buffered", len(current.buffer))
 	}
+	written := current.segment.FramesWritten
+	m.mu.Unlock()
+
+	// Seal through the same rule as Manager.Seal: empty buffer alone is not
+	// enough, the recording file must also verify.
+	report, err := m.writer.Verify(segmentID)
+	if err != nil {
+		return err
+	}
+	if !report.Healthy() {
+		if report.Error != "" {
+			return fmt.Errorf("owner close rejected: %s", report.Error)
+		}
+		return fmt.Errorf("owner close rejected: %d corrupt trailing bytes", report.TailBytes)
+	}
+	if report.FramesOnDisk != written {
+		return fmt.Errorf("owner close rejected: file holds %d frames, counter says %d", report.FramesOnDisk, written)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current = m.sessions[segmentID]
 	current.segment.Status = Sealed
 	current.segment.SealReason = reason
+	current.segment.SealedAt = time.Now().UTC()
+	current.segment.FileBytes = report.Bytes
+	current.segment.ChecksumSHA256 = report.SHA256
+	current.segment.VerifyError = ""
 	return m.flushLocked()
 }
