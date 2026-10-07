@@ -15,6 +15,56 @@ func (r *Runtime) listRecordings(writer http.ResponseWriter, _ *http.Request) {
 	writeJSON(writer, http.StatusOK, map[string]any{"items": r.Recorder.List()})
 }
 
+func (r *Runtime) drainProgress(writer http.ResponseWriter, request *http.Request) {
+	progress, err := r.Recorder.DrainProgress(chi.URLParam(request, "segmentID"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, progress)
+}
+
+func (r *Runtime) drainRecording(writer http.ResponseWriter, request *http.Request) {
+	outcome, err := r.Recorder.Drain(request.Context(), chi.URLParam(request, "segmentID"))
+	if err != nil {
+		// A canceled or failed drain still commits its written/unwritten
+		// boundary; return the outcome so callers can see where it stopped.
+		writeJSON(writer, http.StatusUnprocessableEntity, map[string]any{"error": err.Error(), "status": http.StatusUnprocessableEntity, "outcome": outcome})
+		return
+	}
+	writeJSON(writer, http.StatusOK, outcome)
+}
+
+func (r *Runtime) sealPreview(writer http.ResponseWriter, request *http.Request) {
+	preview, err := r.Recorder.SealPreview(chi.URLParam(request, "segmentID"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, preview)
+}
+
+func (r *Runtime) sealRecording(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Reason string `json:"reason"`
+	}
+	if request.ContentLength > 0 {
+		if err := decodeJSON(request, &input); err != nil {
+			writeError(writer, err)
+			return
+		}
+	}
+	if input.Reason == "" {
+		input.Reason = "manual seal"
+	}
+	result, err := r.Recorder.Seal(chi.URLParam(request, "segmentID"), input.Reason)
+	if err != nil {
+		writeJSON(writer, http.StatusUnprocessableEntity, map[string]any{"error": err.Error(), "status": http.StatusUnprocessableEntity, "result": result})
+		return
+	}
+	writeJSON(writer, http.StatusOK, result)
+}
+
 func (r *Runtime) appendFrame(writer http.ResponseWriter, request *http.Request) {
 	var input struct {
 		Sequence uint64 `json:"sequence"`

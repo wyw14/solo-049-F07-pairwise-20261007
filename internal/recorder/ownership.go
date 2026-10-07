@@ -42,6 +42,13 @@ func (m *Manager) CloseForOwner(segmentID, station string, expectedGeneration in
 	if len(current.buffer) > 0 {
 		return fmt.Errorf("owner close rejected while %d frames remain buffered", len(current.buffer))
 	}
+	verification := m.writer.Verify(segmentID)
+	if !verification.OK {
+		return fmt.Errorf("owner close rejected: file verification failed: %s", verification.Error)
+	}
+	if verification.Frames != current.segment.FramesWritten {
+		return fmt.Errorf("owner close rejected: recording file holds %d frames but %d are accounted written", verification.Frames, current.segment.FramesWritten)
+	}
 	current.segment.Status = Sealed
 	current.segment.SealReason = reason
 	return m.flushLocked()

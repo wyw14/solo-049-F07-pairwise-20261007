@@ -12,8 +12,10 @@ import (
 )
 
 type session struct {
-	segment Segment
-	buffer  []Frame
+	segment     Segment
+	buffer      []Frame
+	draining    bool
+	lastDrained int
 }
 
 type Manager struct {

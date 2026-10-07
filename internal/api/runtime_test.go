@@ -12,6 +12,7 @@ import (
 	stationclock "orbitlink/internal/clock"
 	passsvc "orbitlink/internal/pass"
 	"orbitlink/internal/receiver"
+	"orbitlink/internal/recorder"
 	"orbitlink/internal/rf"
 	"orbitlink/internal/satellite"
 	"orbitlink/internal/weather"
@@ -107,6 +108,92 @@ func TestEphemerisClockAndWindSafetyFlow(t *testing.T) {
 	if err != nil || !result.InhibitConfirmed || !result.Stowed {
 		t.Fatalf("wind safety did not converge: %#v %v", result, err)
 	}
+}
+
+func TestRecordingDrainProgressAndSealEndpoints(t *testing.T) {
+	runtime := newTestRuntime(t)
+	router, err := NewRouter(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	segment, err := runtime.Recorder.Start("pass-endpoint", "north", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := server.URL + "/api/recordings/" + segment.ID
+
+	for _, body := range []string{`{"sequence":1,"epoch":7,"size":64}`, `{"sequence":2,"epoch":7,"size":64}`} {
+		response := requestJSON(t, server.Client(), http.MethodPost, base+"/frames", body)
+		if response.StatusCode != http.StatusAccepted {
+			t.Fatalf("append frame returned %d", response.StatusCode)
+		}
+		_ = response.Body.Close()
+	}
+
+	// Sealing is rejected while frames remain buffered.
+	response := requestJSON(t, server.Client(), http.MethodPost, base+"/seal", `{"reason":"too early"}`)
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("seal with buffered frames returned %d", response.StatusCode)
+	}
+	_ = response.Body.Close()
+
+	response, err = server.Client().Get(base + "/progress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var progress recorder.DrainProgress
+	decodeBody(t, response, &progress)
+	if progress.FramesBuffered != 2 || progress.FramesWritten != 0 || progress.SealReady {
+		t.Fatalf("unexpected progress: %+v", progress)
+	}
+
+	response, err = server.Client().Get(base + "/seal-preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var preview recorder.SealPreview
+	decodeBody(t, response, &preview)
+	if preview.Ready || len(preview.Blockers) == 0 {
+		t.Fatalf("preview should not be ready with buffered frames: %+v", preview)
+	}
+
+	response = requestJSON(t, server.Client(), http.MethodPost, base+"/drain", "")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("drain returned %d", response.StatusCode)
+	}
+	var outcome recorder.DrainOutcome
+	decodeBody(t, response, &outcome)
+	if outcome.Drained != 2 || !outcome.Progress.SealReady || !outcome.Progress.Verified {
+		t.Fatalf("unexpected drain outcome: %+v", outcome)
+	}
+
+	response, err = server.Client().Get(base + "/seal-preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodeBody(t, response, &preview)
+	if !preview.Ready {
+		t.Fatalf("preview not ready after drain: %v", preview.Blockers)
+	}
+
+	response = requestJSON(t, server.Client(), http.MethodPost, base+"/seal", `{"reason":"endpoint test"}`)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("seal returned %d", response.StatusCode)
+	}
+	var result recorder.SealResult
+	decodeBody(t, response, &result)
+	if !result.Complete || !result.Verification.OK || result.Verification.Frames != 2 {
+		t.Fatalf("unexpected seal result: %+v", result)
+	}
+
+	response = requestJSON(t, server.Client(), http.MethodPost, base+"/seal", `{"reason":"again"}`)
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("second seal returned %d", response.StatusCode)
+	}
+	_ = response.Body.Close()
 }
 
 func TestRouterRejectsOverlappingReservation(t *testing.T) {

@@ -11,10 +11,11 @@ import (
 )
 
 type FinalizeResult struct {
-	PassID        string              `json:"pass_id"`
-	UnlockError   string              `json:"unlock_error,omitempty"`
-	FramesDrained int                 `json:"frames_drained"`
-	Seal          recorder.SealResult `json:"seal"`
+	PassID        string                 `json:"pass_id"`
+	UnlockError   string                 `json:"unlock_error,omitempty"`
+	FramesDrained int                    `json:"frames_drained"`
+	Drain         recorder.DrainProgress `json:"drain"`
+	Seal          recorder.SealResult    `json:"seal"`
 }
 
 type Finalizer struct {
@@ -51,8 +52,9 @@ func (f *Finalizer) Finalize(ctx context.Context, passID, chainID string) (Final
 	if unlockErr != nil {
 		result.UnlockError = unlockErr.Error()
 	}
-	drained, drainErr := f.recorder.Drain(ctx, value.RecordingSegmentID)
-	result.FramesDrained = drained
+	outcome, drainErr := f.recorder.Drain(ctx, value.RecordingSegmentID)
+	result.FramesDrained = outcome.Drained
+	result.Drain = outcome.Progress
 	if drainErr != nil {
 		return result, drainErr
 	}
@@ -67,6 +69,6 @@ func (f *Finalizer) Finalize(ctx context.Context, passID, chainID string) (Final
 	}); err != nil {
 		return result, err
 	}
-	_, _ = f.audit.Record(audit.Event{Component: "pass", Action: "finalized", Subject: passID, Fields: map[string]any{"frames_drained": drained, "unlock_error": result.UnlockError}})
+	_, _ = f.audit.Record(audit.Event{Component: "pass", Action: "finalized", Subject: passID, Fields: map[string]any{"frames_drained": result.FramesDrained, "unlock_error": result.UnlockError}})
 	return result, nil
 }
